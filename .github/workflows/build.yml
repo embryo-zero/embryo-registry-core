@@ -1,0 +1,207 @@
+name: build
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches:
+      - 'main'
+      - 'release/*'
+    tags:
+      - 'v*'
+  pull_request:
+
+env:
+  DOCKERHUB_SLUG: distribution/distribution
+  GHCR_SLUG: ghcr.io/${{ github.repository }}
+
+permissions:
+  contents: read # to fetch code (actions/checkout)
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    env:
+      GOTOOLCHAIN: local
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+        go:
+          - 1.26.x
+          - 1.27.x
+    steps:
+      -
+        name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      -
+        name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+          check-latest: true
+      -
+        name: Install Make
+        if: runner.os == 'Windows'
+        run: choco install make --no-progress -y
+      -
+        name: Test
+        shell: bash
+        run: make SHELL=bash test
+
+  test-linux:
+    runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: local
+    strategy:
+      fail-fast: false
+      matrix:
+        go:
+          - 1.26.x
+          - 1.27.x
+        target:
+          - test-coverage
+          - test-s3-storage
+          - test-azure-storage
+    steps:
+      -
+        name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      -
+        name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+          check-latest: true
+      -
+        name: Test
+        run: |
+          make ${{ matrix.target }}
+      -
+        name: Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          directory: ./
+
+  build:
+    permissions:
+      contents: write # to create GitHub release (softprops/action-gh-release)
+      packages: write # so we can push the image to GHCR
+
+    runs-on: ubuntu-latest
+    needs:
+      - test
+      - test-linux
+    steps:
+      -
+        name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      -
+        name: Docker meta
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        with:
+          images: |
+            ${{ env.DOCKERHUB_SLUG }}
+            ${{ env.GHCR_SLUG }}
+          ### versioning strategy
+          ### push semver tag v3.2.1 on main (default branch)
+          # distribution/distribution:3.2.1
+          # distribution/distribution:3.2
+          # distribution/distribution:3
+          # distribution/distribution:latest
+          ### push semver prelease tag v3.0.0-beta.1 on main (default branch)
+          # distribution/distribution:3.0.0-beta.1
+          ### push on main
+          # distribution/distribution:edge
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=ref,event=pr
+            type=edge
+          labels: |
+            org.opencontainers.image.title=Distribution
+            org.opencontainers.image.description=The toolkit to pack, ship, store, and distribute container content
+      -
+        name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      -
+        name: Login to DockerHub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      -
+        name: Log in to GitHub Container registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      -
+        name: Build artifacts
+        uses: docker/bake-action@59cb1203cd42bcefd40a1b6d73b589e48c86040e # v7.5.0
+        with:
+          source: .
+          targets: artifact-all
+      -
+        name: Rename provenance
+        run: |
+          for pdir in ./bin/*/; do
+            (
+              cd "$pdir"
+              binname=$(find . -name '*.tar.gz')
+              filename=$(basename "${binname%.tar.gz}")
+              mv "provenance.json" "${filename}.provenance.json"
+            )
+          done
+      -
+        name: Move and list artifacts
+        run: |
+          mv ./bin/**/* ./bin/
+          tree -nh ./bin
+      -
+        name: Upload artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: registry
+          path: ./bin/*
+          if-no-files-found: error
+      -
+        name: Build image
+        uses: docker/bake-action@59cb1203cd42bcefd40a1b6d73b589e48c86040e # v7.5.0
+        with:
+          source: .
+          files: |
+            ./docker-bake.hcl
+            ${{ steps.meta.outputs.bake-file }}
+          targets: image-all
+          push: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
+      -
+        name: GitHub Release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          draft: true
+          files: |
+            bin/*.tar.gz
+            bin/*.provenance.json
+            bin/*.sha256
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
